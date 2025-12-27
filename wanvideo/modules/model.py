@@ -558,8 +558,7 @@ class WanSelfAttention(nn.Module):
         # output
         return self.o(x.flatten(2))
 
-    def normalized_attention_guidance(self, b, n, d, q, context, nag_context=None, nag_params={}):
-        # NAG text attention
+    def normalized_attention_guidance(self, b, n, d, q, context, nag_context=None, nag_params={}, negpip_strength=None):
         context_positive = context
         context_negative = nag_context
         nag_scale = nag_params['nag_scale']
@@ -570,6 +569,14 @@ class WanSelfAttention(nn.Module):
         v_positive = self.v(context_positive).view(b, -1, n, d)
         k_negative = self.norm_k(self.k(context_negative).to(self.norm_k.weight.dtype)).view(b, -1, n, d).to(q.dtype)
         v_negative = self.v(context_negative).view(b, -1, n, d)
+
+        if negpip_strength is not None:
+            strength = negpip_strength[0] if isinstance(negpip_strength, list) else negpip_strength
+            if strength is not None:
+                seq_len = min(strength.shape[0], v_positive.shape[1])
+                strength_broadcasted = torch.ones(v_positive.shape[1], device=v_positive.device, dtype=v_positive.dtype)
+                strength_broadcasted[:seq_len] = strength[:seq_len].to(v_positive.device, v_positive.dtype)
+                v_positive = v_positive * strength_broadcasted[None, :, None, None]
 
         x_positive = attention(q, k_positive, v_positive, attention_mode=self.attention_mode, heads=self.num_heads)
         x_positive = x_positive.flatten(2)
@@ -633,10 +640,10 @@ class WanT2VCrossAttention(WanSelfAttention):
     def forward(self, x, context, grid_sizes=None, clip_embed=None, audio_proj=None, audio_scale=1.0,
                 num_latent_frames=21, nag_params={}, nag_context=None, rope_func="comfy",
                 inner_t=None, inner_c=None, cross_freqs=None,
-                adapter_proj=None, adapter_attn_mask=None, ip_scale=1.0, orig_seq_len=None, lynx_x_ip=None, lynx_ip_scale=1.0, longcat_num_cond_latents=None, **kwargs):
+                adapter_proj=None, adapter_attn_mask=None, ip_scale=1.0, orig_seq_len=None, lynx_x_ip=None, lynx_ip_scale=1.0, longcat_num_cond_latents=None,
+                negpip_strength=None, **kwargs):
         b, n, d = x.size(0), self.num_heads, self.head_dim
         s = x.size(1)
-        # compute query
         is_longcat = x.shape[-1] == 4096
 
         if is_longcat:
@@ -648,7 +655,7 @@ class WanT2VCrossAttention(WanSelfAttention):
             q = self.norm_q(self.q(x).to(self.norm_q.weight.dtype),num_chunks=2 if rope_func == "comfy_chunked" else 1).to(x.dtype).view(b, -1, n, d)
 
         if nag_context is not None:
-            x = self.normalized_attention_guidance(b, n, d, q, context, nag_context, nag_params)
+            x = self.normalized_attention_guidance(b, n, d, q, context, nag_context, nag_params, negpip_strength)
         else:
             if is_longcat:
                 k = self.norm_k(self.k(context).to(self.norm_k.weight.dtype).view(b, -1, n, d)).to(x.dtype)
@@ -656,6 +663,14 @@ class WanT2VCrossAttention(WanSelfAttention):
                 k = self.norm_k(self.k(context).to(self.norm_k.weight.dtype)).to(x.dtype).view(b, -1, n, d)
 
             v = self.v(context).view(b, -1, n, d)
+
+            if negpip_strength is not None:
+                strength = negpip_strength[0] if isinstance(negpip_strength, list) else negpip_strength
+                if strength is not None:
+                    seq_len = min(strength.shape[0], v.shape[1])
+                    strength_broadcasted = torch.ones(v.shape[1], device=v.device, dtype=v.dtype)
+                    strength_broadcasted[:seq_len] = strength[:seq_len].to(v.device, v.dtype)
+                    v = v * strength_broadcasted[None, :, None, None]
 
             #EchoShot rope
             if inner_t is not None and cross_freqs is not None:
@@ -728,23 +743,25 @@ class WanI2VCrossAttention(WanSelfAttention):
 
     def forward(self, x, context, grid_sizes=None, clip_embed=None, audio_proj=None,
                 audio_scale=1.0, num_latent_frames=21, nag_params={}, nag_context=None, rope_func="comfy",
-                adapter_proj=None, adapter_attn_mask=None, ip_scale=1.0, orig_seq_len=None, **kwargs):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L1, C]
-            context(Tensor): Shape [B, L2, C]
-        """
+                adapter_proj=None, adapter_attn_mask=None, ip_scale=1.0, orig_seq_len=None,
+                negpip_strength=None, **kwargs):
         b, n, d = x.size(0), self.num_heads, self.head_dim
-
-        # compute query
         q = self.norm_q(self.q(x).to(self.norm_q.weight.dtype),num_chunks=2 if rope_func == "comfy_chunked" else 1).view(b, -1, n, d).to(x.dtype)
 
         if nag_context is not None:
-            x_text = self.normalized_attention_guidance(b, n, d, q, context, nag_context, nag_params)
+            x_text = self.normalized_attention_guidance(b, n, d, q, context, nag_context, nag_params, negpip_strength)
         else:
-            # text attention
             k = self.norm_k(self.k(context).to(self.norm_k.weight.dtype)).view(b, -1, n, d).to(x.dtype)
             v = self.v(context).view(b, -1, n, d)
+
+            if negpip_strength is not None:
+                strength = negpip_strength[0] if isinstance(negpip_strength, list) else negpip_strength
+                if strength is not None:
+                    seq_len = min(strength.shape[0], v.shape[1])
+                    strength_broadcasted = torch.ones(v.shape[1], device=v.device, dtype=v.dtype)
+                    strength_broadcasted[:seq_len] = strength[:seq_len].to(v.device, v.dtype)
+                    v = v * strength_broadcasted[None, :, None, None]
+
             x_text = attention(q, k, v, attention_mode=self.attention_mode, heads=self.num_heads).flatten(2)
 
         #img attention
@@ -992,7 +1009,8 @@ class WanAttentionBlock(nn.Module):
         num_latent_frames=21,
         original_seq_len=None,
         enhance_enabled=False, #feta
-        nag_params={}, nag_context=None, #normalized attention guidance
+        nag_params={}, nag_context=None,
+        negpip_strength=None,
         multitalk_audio_embedding=None, ref_target_masks=None, human_num=0, #multitalk
         inner_t=None, inner_c=None, cross_freqs=None, #echoshot
         x_ip=None, e_ip=None, freqs_ip=None, ip_scale=1.0, #stand-in
@@ -1312,7 +1330,8 @@ class WanAttentionBlock(nn.Module):
                 x = x + self.cross_attn(self.norm3(x.to(self.norm3.weight.dtype)).to(input_dtype), context, grid_sizes, clip_embed=clip_embed, audio_proj=audio_proj, audio_scale=audio_scale,
                                     num_latent_frames=num_latent_frames, nag_params=nag_params, nag_context=nag_context,
                                     rope_func=self.rope_func, inner_t=inner_t, inner_c=inner_c, cross_freqs=cross_freqs,
-                                    adapter_proj=adapter_proj, ip_scale=ip_scale, orig_seq_len=original_seq_len, lynx_x_ip=lynx_x_ip, lynx_ip_scale=lynx_ip_scale, longcat_num_cond_latents=longcat_num_cond_latents)
+                                    adapter_proj=adapter_proj, ip_scale=ip_scale, orig_seq_len=original_seq_len, lynx_x_ip=lynx_x_ip, lynx_ip_scale=lynx_ip_scale, longcat_num_cond_latents=longcat_num_cond_latents,
+                                    negpip_strength=negpip_strength)
                 x = x.to(input_dtype)
                 # MultiTalk
                 if multitalk_audio_embedding is not None and not isinstance(self, VaceWanAttentionBlock):
@@ -2295,6 +2314,7 @@ class WanModel(torch.nn.Module):
         uni3c_data=None, controlnet=None,
         add_cond=None, attn_cond=None,
         nag_params={}, nag_context=None,
+        negpip_strength=None,
         multitalk_audio=None,
         ref_target_masks=None,
         inner_t=None,
@@ -3044,6 +3064,7 @@ class WanModel(torch.nn.Module):
                 audio_scale=audio_scale,
                 nag_params=nag_params,
                 nag_context=nag_context if not is_uncond else None,
+                negpip_strength=negpip_strength if not is_uncond else None,
                 multitalk_audio_embedding=multitalk_audio_embedding if multitalk_audio is not None else None,
                 ref_target_masks=token_ref_target_masks if multitalk_audio is not None else None,
                 human_num=human_num if multitalk_audio is not None else 0,

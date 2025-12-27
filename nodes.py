@@ -158,32 +158,48 @@ def get_cache_path(prompt):
     return os.path.join(cache_dir, f"{cache_hash}.pt")
 
 def get_cached_text_embeds(positive_prompt, negative_prompt):
-    
+    """Load cached text embeddings and negpip strength from disk.
+
+    Cache format (v2): {"embeddings": tensor/list, "negpip_strength": tensor/list/None}
+    Falls back to raw tensor for old cache files.
+    """
     os.makedirs(cache_dir, exist_ok=True)
 
     context = None
     context_null = None
+    negpip_strength = None
 
     pos_cache_path = get_cache_path(positive_prompt)
     neg_cache_path = get_cache_path(negative_prompt)
 
-    # Try to load positive prompt embeds
     if os.path.exists(pos_cache_path):
         try:
-            log.info(f"Loading prompt embeds from cache: {pos_cache_path}")
-            context = torch.load(pos_cache_path)
+            log.info(f"Loading positive embeds from cache: {pos_cache_path}")
+            cached = torch.load(pos_cache_path)
+            # Handle both old format (raw tensor) and new format (dict)
+            if isinstance(cached, dict):
+                context = cached.get("embeddings")
+                negpip_strength = cached.get("negpip_strength")
+                if negpip_strength is not None:
+                    log.info(f"Loaded negpip_strength from cache")
+            else:
+                context = cached  # Old format: raw tensor
         except Exception as e:
-            log.warning(f"Failed to load cache: {e}, will re-encode.")
+            log.warning(f"Failed to load positive cache: {e}, will re-encode.")
 
-    # Try to load negative prompt embeds
     if os.path.exists(neg_cache_path):
         try:
-            log.info(f"Loading prompt embeds from cache: {neg_cache_path}")
-            context_null = torch.load(neg_cache_path)
+            log.info(f"Loading negative embeds from cache: {neg_cache_path}")
+            cached = torch.load(neg_cache_path)
+            # Handle both old format (raw tensor) and new format (dict)
+            if isinstance(cached, dict):
+                context_null = cached.get("embeddings")
+            else:
+                context_null = cached  # Old format: raw tensor
         except Exception as e:
-            log.warning(f"Failed to load cache: {e}, will re-encode.")
+            log.warning(f"Failed to load negative cache: {e}, will re-encode.")
 
-    return context, context_null
+    return context, context_null, negpip_strength
 
 class WanVideoTextEncodeCached:
     @classmethod
@@ -254,12 +270,13 @@ of the original Wan templates or a custom system prompt.
 
         # Now check disk cache using the (possibly extended) prompt
         if use_disk_cache:
-            context, context_null = get_cached_text_embeds(positive_prompt, negative_prompt)
+            context, context_null, negpip_strength = get_cached_text_embeds(positive_prompt, negative_prompt)
             if context is not None and context_null is not None:
                 return{
                     "prompt_embeds": context,
                     "negative_prompt_embeds": context_null,
                     "echoshot": echoshot,
+                    "negpip_strength": negpip_strength,
                 },{"prompt_embeds": context_null}, positive_prompt
 
         t5, = LoadWanVideoT5TextEncoder().loadmodel(model_name, precision, "main_device", quantization)
@@ -311,14 +328,15 @@ class WanVideoTextEncode:
         echoshot = True if "[1]" in positive_prompt else False
 
         if use_disk_cache:
-            context, context_null = get_cached_text_embeds(positive_prompt, negative_prompt)
+            context, context_null, negpip_strength = get_cached_text_embeds(positive_prompt, negative_prompt)
             if context is not None and context_null is not None:
                 return{
                     "prompt_embeds": context,
                     "negative_prompt_embeds": context_null,
                     "echoshot": echoshot,
+                    "negpip_strength": negpip_strength,
                 },
-            
+
         if t5 is None:
             raise ValueError("No cached text embeds found for prompts, please provide a T5 encoder.")
 
@@ -333,7 +351,8 @@ class WanVideoTextEncode:
         dtype = t5["dtype"]
         
         positive_prompts = []
-        all_weights = []
+        # all_weights = []  # DISABLED: see parse_prompt_weights note below
+        all_negpip_tokens = []
 
         # Split positive prompts and process each with weights
         if "|" in positive_prompt:
@@ -347,11 +366,23 @@ class WanVideoTextEncode:
             assert len(positive_prompts_raw) > 1 and len(positive_prompts_raw) < 7, 'Input shot num must between 2~6 !'
         else:
             positive_prompts_raw = [positive_prompt.strip()]
-            
+
         for p in positive_prompts_raw:
-            cleaned_prompt, weights = self.parse_prompt_weights(p)
+            # Extract negpip tokens - handles both suppress (<1.0) and boost (>1.0)
+            cleaned_prompt, negpip_tokens = self.parse_negpip_tokens(p)
+            all_negpip_tokens.append(negpip_tokens)
+            if negpip_tokens:
+                suppress = [t['text'] for t in negpip_tokens if t['weight'] < 1.0]
+                boost = [t['text'] for t in negpip_tokens if t['weight'] > 1.0]
+                if suppress:
+                    log.info(f"Negpip suppress (removed from prompt): {suppress}")
+                if boost:
+                    log.info(f"Negpip boost (kept in prompt + extra tokens): {boost}")
+            # DISABLED: parse_prompt_weights scales the ENTIRE embedding by weight,
+            # which is incorrect. Negpip handles weighted tokens via V-scaling instead.
+            # cleaned_prompt, weights = self.parse_prompt_weights(cleaned_from_negpip)
+            # all_weights.append(weights)
             positive_prompts.append(cleaned_prompt)
-            all_weights.append(weights)
 
         mm.soft_empty_cache()
 
@@ -375,24 +406,78 @@ class WanVideoTextEncode:
             mm.soft_empty_cache()
             gc.collect()
 
+        # Track if context was loaded from cache (already has negpip tokens appended)
+        context_from_cache = use_disk_cache and context is not None
+
         with torch.autocast(device_type=mm.get_autocast_device(device_to), dtype=encoder.dtype, enabled=encoder.quantization != 'disabled'):
             # Encode positive if not loaded from cache
-            if use_disk_cache and context is not None:
+            if context_from_cache:
                 pass
             else:
                 context = encoder(positive_prompts, device_to)
-                # Apply weights to embeddings if any were extracted
-                for i, weights in enumerate(all_weights):
-                    for text, weight in weights.items():
-                        log.info(f"Applying weight {weight} to prompt: {text}")
-                        if len(weights) > 0:
-                            context[i] = context[i] * weight
 
             # Encode negative if not loaded from cache
             if use_disk_cache and context_null is not None:
                 pass
             else:
                 context_null = encoder([negative_prompt], device_to)
+
+            # Skip negpip processing if context was loaded from cache
+            # (cached context already has negpip tokens appended, negpip_strength already loaded)
+            if context_from_cache:
+                has_negpip = negpip_strength is not None
+            else:
+                negpip_strength = []
+                max_len = 512
+                has_negpip = False
+
+            for i, negpip_tokens in enumerate(all_negpip_tokens) if not context_from_cache else []:
+                original_len = context[i].shape[0]
+
+                if negpip_tokens:
+                    token_texts = [t["text"] for t in negpip_tokens]
+                    token_weights = [t["weight"] for t in negpip_tokens]
+                    negpip_context = encoder(token_texts, device_to)
+                    total_negpip = sum(ctx.shape[0] for ctx in negpip_context)
+
+                    available = max_len - original_len
+                    if total_negpip > available:
+                        log.warning(f"Negpip tokens ({total_negpip}) exceed available space ({available}), truncating")
+                        truncated = []
+                        remaining = available
+                        truncated_weights = []
+                        for ctx, w in zip(negpip_context, token_weights):
+                            if remaining <= 0:
+                                break
+                            if ctx.shape[0] <= remaining:
+                                truncated.append(ctx)
+                                truncated_weights.append(w)
+                                remaining -= ctx.shape[0]
+                            else:
+                                truncated.append(ctx[:remaining])
+                                truncated_weights.append(w)
+                                remaining = 0
+                        negpip_context = truncated
+                        token_weights = truncated_weights
+                        total_negpip = sum(ctx.shape[0] for ctx in negpip_context)
+
+                    if negpip_context:
+                        combined_negpip = torch.cat(negpip_context, dim=0)
+                        context[i] = torch.cat([context[i], combined_negpip], dim=0)
+
+                        strength = torch.ones(context[i].shape[0], device=device_to, dtype=context[i].dtype)
+                        pos = original_len
+                        for ctx, weight in zip(negpip_context, token_weights):
+                            strength[pos:pos+ctx.shape[0]] = weight
+                            pos += ctx.shape[0]
+
+                        negpip_strength.append(strength)
+                        has_negpip = True
+                        log.info(f"Negpip: added {total_negpip} tokens at position {original_len}, weights={token_weights}")
+                    else:
+                        negpip_strength.append(None)
+                else:
+                    negpip_strength.append(None)
 
         if force_offload:
             encoder.model.to(offload_device)
@@ -403,33 +488,40 @@ class WanVideoTextEncode:
             "prompt_embeds": context,
             "negative_prompt_embeds": context_null,
             "echoshot": echoshot,
+            "negpip_strength": negpip_strength if has_negpip else None,
         }
 
-        # Save each part to its own cache file if needed
         if use_disk_cache:
             pos_cache_path = get_cache_path(positive_prompt)
             neg_cache_path = get_cache_path(negative_prompt)
             try:
                 if not os.path.exists(pos_cache_path):
-                    torch.save(context, pos_cache_path)
-                    log.info(f"Saved prompt embeds to cache: {pos_cache_path}")
+                    # Save embeddings and negpip_strength together in one file
+                    cache_data = {
+                        "embeddings": context,
+                        "negpip_strength": negpip_strength if has_negpip else None
+                    }
+                    torch.save(cache_data, pos_cache_path)
+                    log.info(f"Saved positive embeds to cache: {pos_cache_path}")
             except Exception as e:
-                log.warning(f"Failed to save cache: {e}")
+                log.warning(f"Failed to save positive cache: {e}")
             try:
                 if not os.path.exists(neg_cache_path):
-                    torch.save(context_null, neg_cache_path)
-                    log.info(f"Saved prompt embeds to cache: {neg_cache_path}")
+                    cache_data = {"embeddings": context_null}
+                    torch.save(cache_data, neg_cache_path)
+                    log.info(f"Saved negative embeds to cache: {neg_cache_path}")
             except Exception as e:
-                log.warning(f"Failed to save cache: {e}")
+                log.warning(f"Failed to save negative cache: {e}")
 
         return (prompt_embeds_dict,)
     
     def parse_prompt_weights(self, prompt):
-        """Extract text and weights from prompts with (text:weight) format"""
+        """Extract text and weights from prompts with (text:weight) format - positive weights only"""
         import re
-        
-        # Parse all instances of (text:weight) in the prompt
-        pattern = r'\((.*?):([\d\.]+)\)'
+
+        # Parse all instances of (text:weight) in the prompt - only positive weights
+        # Negative weights like (text:-1.0) are handled by parse_negpip_tokens()
+        pattern = r'\(([^(:)]+):(\+?[\d\.]+)\)'
         matches = re.findall(pattern, prompt)
         
         # Replace each match with just the text part
@@ -443,7 +535,48 @@ class WanVideoTextEncode:
             weights[text] = float(weight)
             
         return cleaned_prompt, weights
-    
+
+    def parse_negpip_tokens(self, prompt):
+        """Extract weighted tokens (text:weight) from prompt.
+
+        Behavior based on weight:
+        - weight < 1.0 (suppress): Remove text from prompt, append tokens with reduced V-scaling
+        - weight > 1.0 (boost): Keep text in prompt, append extra tokens with boosted V-scaling
+        - weight == 1.0: No effect, skip entirely
+        """
+        import re
+
+        pattern = r'\(([^(:)]+):\s*([+-]?[\d\.]+)\)'
+        matches = re.findall(pattern, prompt)
+
+        negpip_tokens = []
+        cleaned_prompt = prompt
+
+        for text, weight in matches:
+            weight_float = float(weight)
+            if weight_float == 1.0:
+                # No effect, just remove the syntax but keep the text
+                orig_text = f"({text}:{weight})"
+                cleaned_prompt = cleaned_prompt.replace(orig_text, text.strip())
+            elif weight_float < 1.0:
+                # Suppress: remove from prompt entirely, append with reduced weight
+                orig_text = f"({text}:{weight})"
+                cleaned_prompt = cleaned_prompt.replace(orig_text, "")
+                negpip_tokens.append({
+                    "text": text.strip(),
+                    "weight": weight_float
+                })
+            else:
+                # Boost (weight > 1.0): keep text in prompt, will also append with boosted weight
+                orig_text = f"({text}:{weight})"
+                cleaned_prompt = cleaned_prompt.replace(orig_text, text.strip())
+                negpip_tokens.append({
+                    "text": text.strip(),
+                    "weight": weight_float
+                })
+
+        return cleaned_prompt.strip(), negpip_tokens
+
 class WanVideoTextEncodeSingle:
     @classmethod
     def INPUT_TYPES(s):

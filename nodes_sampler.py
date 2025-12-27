@@ -1403,6 +1403,15 @@ class WanVideoSampler:
                 if wanmove_embeds is not None and context_window is not None:
                     image_cond_input = replace_feature(image_cond_input.unsqueeze(0), track_pos[:, context_window].unsqueeze(0), wanmove_embeds.get("strength", 1.0))[0]
 
+                negpip_val = text_embeds.get("negpip_strength", None)
+                if negpip_val is not None:
+                    # Get the strength tensor (first element if list)
+                    s = negpip_val[0] if isinstance(negpip_val, list) else negpip_val
+                    if s is not None and torch.is_tensor(s):
+                        non_default = s[s != 1.0]
+                        unique_weights = non_default.unique().tolist()
+                        log.info(f"[Negpip] {len(non_default)} weighted tokens, weights={[round(w, 2) for w in unique_weights]}")
+
                 base_params = {
                     'x': [z], # latent
                     'y': [image_cond_input] if image_cond_input is not None else None, # image cond
@@ -1428,6 +1437,7 @@ class WanVideoSampler:
                     "add_cond": add_cond_input, # additional conditioning input
                     "nag_params": text_embeds.get("nag_params", {}), # normalized attention guidance
                     "nag_context": text_embeds.get("nag_prompt_embeds", None), # normalized attention guidance context
+                    "negpip_strength": negpip_val,
                     "multitalk_audio": multitalk_audio_input, # Multi/InfiniteTalk audio input
                     "ref_target_masks": ref_target_masks if multitalk_audio_embeds is not None else None, # Multi/InfiniteTalk reference target masks
                     "inner_t": [shot_len] if shot_len else None, # inner timestep for EchoShot
@@ -1821,6 +1831,7 @@ class WanVideoSampler:
                     enhance_enabled = False
                     if feta_args is not None and feta_start_percent <= current_step_percentage <= feta_end_percent:
                         enhance_enabled = True
+
                     #region context windowing
                     if context_options is not None:
                         counter = torch.zeros_like(latent_model_input, device=device)
@@ -1853,6 +1864,10 @@ class WanVideoSampler:
                                 positive = [text_embeds["prompt_embeds"][prompt_index]]
                             else:
                                 positive = text_embeds["prompt_embeds"]
+
+                            # Update negpip_strength for this prompt section
+                            if negpip_val is not None and isinstance(negpip_val, list) and len(negpip_val) > prompt_index:
+                                base_params["negpip_strength"] = negpip_val[prompt_index]
 
                             partial_img_emb = partial_control_latents = None
                             if image_cond is not None:
