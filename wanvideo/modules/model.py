@@ -577,6 +577,9 @@ class WanSelfAttention(nn.Module):
                 strength_broadcasted = torch.ones(v_positive.shape[1], device=v_positive.device, dtype=v_positive.dtype)
                 strength_broadcasted[:seq_len] = strength[:seq_len].to(v_positive.device, v_positive.dtype)
                 v_positive = v_positive * strength_broadcasted[None, :, None, None]
+                k_deviation = (strength_broadcasted - 1.0) * 0.5
+                k_strength = torch.clamp(1.0 + k_deviation, min=0.0)
+                k_positive = k_positive * k_strength[None, :, None, None]
 
         x_positive = attention(q, k_positive, v_positive, attention_mode=self.attention_mode, heads=self.num_heads)
         x_positive = x_positive.flatten(2)
@@ -671,6 +674,9 @@ class WanT2VCrossAttention(WanSelfAttention):
                     strength_broadcasted = torch.ones(v.shape[1], device=v.device, dtype=v.dtype)
                     strength_broadcasted[:seq_len] = strength[:seq_len].to(v.device, v.dtype)
                     v = v * strength_broadcasted[None, :, None, None]
+                    k_deviation = (strength_broadcasted - 1.0) * 0.5
+                    k_strength = torch.clamp(1.0 + k_deviation, min=0.0)
+                    k = k * k_strength[None, :, None, None]
 
             #EchoShot rope
             if inner_t is not None and cross_freqs is not None:
@@ -761,6 +767,9 @@ class WanI2VCrossAttention(WanSelfAttention):
                     strength_broadcasted = torch.ones(v.shape[1], device=v.device, dtype=v.dtype)
                     strength_broadcasted[:seq_len] = strength[:seq_len].to(v.device, v.dtype)
                     v = v * strength_broadcasted[None, :, None, None]
+                    k_deviation = (strength_broadcasted - 1.0) * 0.5
+                    k_strength = torch.clamp(1.0 + k_deviation, min=0.0)
+                    k = k * k_strength[None, :, None, None]
 
             x_text = attention(q, k, v, attention_mode=self.attention_mode, heads=self.num_heads).flatten(2)
 
