@@ -1,43 +1,21 @@
-# Negpip - Weighted Prompting for Wan 2.2
+# Negpip - Experimental Weighted Prompting for Wan 2.2
 
-Works at CFG=1.0 (Scales V-vectors in cross-attention, no CFG combination).
+Experimental fork. Scales K and V vectors in cross-attention. Works at CFG=1.0.
+
+Based on: https://github.com/hako-mikan/sd-webui-negpip
 
 ## Syntax
 
-`(text:weight)` in your positive prompt.
+`(text:weight)` - values below 1.0 suppress, above 1.0 boost.
 
-| Weight | Effect |
-|--------|--------|
-| **< 1.0** | Suppress/reduce |
-| **> 1.0** | Boost/amplify |
-| **= 1.0** | No effect |
+Effective range roughly **-1.5 to 1.5**. Higher values can cause artifacts depending on the model. Results vary depending on phrasing.
+In general the negative weighting seems to be a bit more effective. Can get some nice results sometimes but I'll probably not keep this updated.
 
-Negative values invert the concept.
-
-## Behavior
-
-- **Suppress** (weight < 1.0): Text removed from prompt, appended separately. Don't put mid-sentence or you'll get gaps like "a woman with walking".
-- **Boost** (weight > 1.0): Text stays in prompt for context, plus extra V-scaling
+V-only version available at commit [115809c](https://github.com/amatiramisu/ComfyUI-WanVideoWrapper-negpip/commit/115809c)
 
 ## Examples
 
-Suppress:
-```
-a woman with black hair. (blonde hair:-1.0)
-```
+- a woman with black hair. (blonde hair:-1.0)
+- a cat sitting on a (red couch:1.3)
 
-Boost:
-```
-a cat sitting on a (red couch:1.5)
-```
-
-Combined:
-```
-a man walking through a forest. (rain:-0.5) (fog:1.8)
-a man walking through a (foggy:1.8) forest. (rain:-0.5)
-```
-
-based on the original from: https://github.com/hako-mikan/sd-webui-negpip
-
-
-
+Suppress phrases should be separate, not mid-sentence.
